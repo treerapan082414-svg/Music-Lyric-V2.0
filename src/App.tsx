@@ -40,6 +40,15 @@ import {
 import { decodeAudio, type AudioData } from "./audio";
 import { download, loadLocal, saveLocal } from "./storage";
 import { dimensions, exportVideo, renderFrame, videoMime } from "./render";
+import SyncPanel, { WordTimingEditor } from "./SyncPanel";
+import {
+  applyAlignment,
+  clearMatch,
+  lineCanApply,
+  shiftSegment,
+  splitWords,
+  manualWord,
+} from "./alignment";
 
 const tabs = [
   { id: "lyrics", label: "เนื้อเพลง", icon: FileText },
@@ -77,6 +86,8 @@ export default function App() {
   const [help, setHelp] = useState(false);
   const [volume, setVolume] = useState(0.8);
   const [exporting, setExporting] = useState(false);
+  const [syncing, setSyncing] = useState(false);
+  const auditionEnd = useRef<number | null>(null);
   const [progress, setProgress] = useState(0);
   const [result, setResult] = useState<Blob | null>(null);
   const [resultUrl, setResultUrl] = useState("");
@@ -97,11 +108,16 @@ export default function App() {
   const source = useRef<MediaElementAudioSourceNode | null>(null);
   const abort = useRef<AbortController | null>(null);
   const writing = useRef(Promise.resolve());
+  const saveRevision = useRef(0);
+  const storageBlocked = useRef(false);
+  const dirty = useRef(false);
   const fail = (e: unknown) =>
     setError(e instanceof Error ? e.message : "เกิดข้อผิดพลาด กรุณาลองใหม่");
   const commit = useCallback((change: Project | ((p: Project) => Project)) => {
     const old = projectRef.current;
     const next = typeof change === "function" ? change(old) : change;
+    dirty.current = true;
+    saveRevision.current++;
     history.current.past.push(old);
     if (history.current.past.length > 80) history.current.past.shift();
     history.current.future = [];
@@ -111,6 +127,9 @@ export default function App() {
     setResult(null);
   }, []);
   function replaceProject(next: Project) {
+    dirty.current = true;
+    saveRevision.current++;
+    storageBlocked.current = false;
     history.current = { past: [], future: [] };
     projectRef.current = next;
     setProject(next);
@@ -123,6 +142,8 @@ export default function App() {
     const to = redo ? h.past : h.future;
     const next = from.pop();
     if (next) {
+      dirty.current = true;
+      saveRevision.current++;
       to.push(projectRef.current);
       projectRef.current = next;
       setProject(next);
@@ -138,21 +159,31 @@ export default function App() {
         if (!live) return;
         if (data) {
           const p = validateProject(data.project);
-          setProject(p);
-          projectRef.current = p;
-          setAudioBlob(data.audio);
+          let decoded: AudioData | null = null;
           if (data.audio) {
             try {
-              setAudioData(await decodeAudio(data.audio));
+              decoded = await decodeAudio(data.audio);
             } catch {
               setError("กู้คืนเพลงไม่ได้ กรุณาแนบไฟล์เพลงอีกครั้ง");
             }
-          } else if (p.audioName)
-            setNotice("โปรเจกต์นี้ยังไม่มีไฟล์เพลง กรุณาแนบเพลงอีกครั้ง");
-          setNotice("กู้คืนโปรเจกต์ล่าสุดแล้ว");
+          }
+          if (!live) return;
+          setProject(p);
+          projectRef.current = p;
+          setAudioBlob(data.audio);
+          setAudioData(decoded);
+          setNotice(
+            !data.audio && p.audioName
+              ? "โปรเจกต์นี้ยังไม่มีไฟล์เพลง กรุณาแนบเพลงอีกครั้ง"
+              : "กู้คืนโปรเจกต์ล่าสุดแล้ว",
+          );
+          setSaved("กู้คืนงานที่บันทึกแล้ว");
         }
       })
-      .catch(fail)
+      .catch((e) => {
+        storageBlocked.current = true;
+        fail(e);
+      })
       .finally(() => {
         if (live) setLoaded(true);
       });
@@ -179,14 +210,23 @@ export default function App() {
     return () => URL.revokeObjectURL(url);
   }, [result]);
   useEffect(() => {
-    if (!loaded) return;
+    if (!loaded || storageBlocked.current || !dirty.current) return;
+    const revision = saveRevision.current;
     setSaved("กำลังบันทึก…");
     const timer = setTimeout(() => {
       writing.current = writing.current
         .catch(() => {})
         .then(() => saveLocal(project, audioBlob))
-        .then(() => setSaved("บันทึกในเครื่องแล้ว"))
-        .catch(() => setSaved("บันทึกไม่สำเร็จ — ดาวน์โหลดโปรเจกต์สำรอง"));
+        .then(() => {
+          if (revision === saveRevision.current) {
+            dirty.current = false;
+            setSaved("บันทึกในเครื่องแล้ว");
+          }
+        })
+        .catch(() => {
+          if (revision === saveRevision.current)
+            setSaved("บันทึกไม่สำเร็จ — ดาวน์โหลดโปรเจกต์สำรอง");
+        });
     }, 800);
     return () => clearTimeout(timer);
   }, [project, audioBlob, loaded]);
@@ -197,6 +237,10 @@ export default function App() {
     let raf = 0;
     const frame = () => {
       const t = audio.current?.currentTime ?? 0;
+      if (auditionEnd.current !== null && t >= auditionEnd.current) {
+        audio.current?.pause();
+        auditionEnd.current = null;
+      }
       setTime(t);
       if (canvas.current) {
         let bins: Uint8Array | undefined;
@@ -264,6 +308,7 @@ export default function App() {
     }
   }
   async function uploadAudio(file?: File) {
+    if (!loaded) return;
     if (!file) return;
     if (file.size > 150 * 1024 * 1024) {
       setError("ไฟล์ใหญ่เกิน 150 MB กรุณาใช้เพลงที่สั้นลง");
@@ -278,12 +323,28 @@ export default function App() {
     try {
       audio.current?.pause();
       const data = await decodeAudio(file);
+      const fingerprint = [
+        ...new Uint8Array(
+          await crypto.subtle.digest("SHA-256", await file.arrayBuffer()),
+        ),
+      ]
+        .map((b) => b.toString(16).padStart(2, "0"))
+        .join("");
       setAudioData(data);
       setAudioBlob(file);
       replaceProject({
         ...projectRef.current,
         audioName: file.name,
         duration: data.buffer.duration,
+        audioFingerprint: fingerprint,
+        transcript:
+          projectRef.current.audioFingerprint === fingerprint
+            ? projectRef.current.transcript
+            : undefined,
+        lyrics:
+          projectRef.current.audioFingerprint === fingerprint
+            ? projectRef.current.lyrics
+            : projectRef.current.lyrics.map(clearMatch),
       });
       setNotice("อ่าน waveform สำเร็จ — พร้อมจับเวลาเนื้อเพลง");
     } catch {
@@ -308,7 +369,18 @@ export default function App() {
   function editSegment(id: string, patch: Partial<Segment>) {
     commit((p) => ({
       ...p,
-      lyrics: p.lyrics.map((x) => (x.id === id ? { ...x, ...patch } : x)),
+      lyrics: p.lyrics.map((x) =>
+        x.id === id
+          ? {
+              ...((patch.text !== undefined && patch.text !== x.text) ||
+              patch.start !== undefined ||
+              patch.end !== undefined
+                ? clearMatch(x)
+                : x),
+              ...patch,
+            }
+          : x,
+      ),
     }));
   }
   function stamp(which: "start" | "end") {
@@ -328,7 +400,7 @@ export default function App() {
       lyrics: p.lyrics.map((x, i) => {
         if (i === index)
           return {
-            ...x,
+            ...clearMatch(x),
             [which]: now,
             ...(which === "start" && x.end <= now
               ? { end: Math.min(now + 3, p.duration) }
@@ -336,7 +408,7 @@ export default function App() {
             source: "manual",
           };
         if (which === "start" && i === index - 1 && x.end > now)
-          return { ...x, end: now };
+          return { ...clearMatch(x), end: now };
         return x;
       }),
     });
@@ -356,13 +428,13 @@ export default function App() {
       lyrics: p.lyrics.map((x, i) =>
         i === index
           ? {
-              ...x,
+              ...clearMatch(x),
               start: now,
               end: Math.max(now + 0.001, x.end),
               source: "manual",
             }
           : i === index - 1
-            ? { ...x, end: now, source: "manual" }
+            ? { ...clearMatch(x), end: now, source: "manual" }
             : x,
       ),
     });
@@ -389,7 +461,7 @@ export default function App() {
         )
       )
         return;
-      if (exporting || help) return;
+      if (exporting || help || syncing || busy) return;
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
         e.preventDefault();
         saveJson();
@@ -487,6 +559,8 @@ export default function App() {
     let next = p;
     const mode = edge ?? "move";
     const move = (ev: PointerEvent) => {
+      dirty.current = true;
+      saveRevision.current++;
       const delta = ((ev.clientX - startX) / rect.width) * (p.duration || 120);
       let a = segment.start,
         b = segment.end;
@@ -501,7 +575,14 @@ export default function App() {
         ...p,
         lyrics: p.lyrics.map((x) =>
           x.id === segment.id
-            ? { ...x, start: a, end: b, source: "manual" }
+            ? {
+                ...(mode === "move"
+                  ? shiftSegment(x, a - x.start)
+                  : clearMatch(x)),
+                start: a,
+                end: b,
+                source: "manual",
+              }
             : x,
         ),
       };
@@ -525,10 +606,12 @@ export default function App() {
   return (
     <div
       className="studio"
+      data-ready={loaded ? "true" : "false"}
+      inert={syncing || undefined}
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
-        if (exporting || busy || !loaded) return;
+        if (exporting || syncing || busy || !loaded) return;
         const file = e.dataTransfer.files[0];
         if (!file) return;
         if (/\.(txt|lrc|srt|vtt)$/i.test(file.name))
@@ -666,7 +749,7 @@ export default function App() {
           <button
             className="primary export-top"
             onClick={() => void startExport()}
-            disabled={!loaded || !!busy || exporting}
+            disabled={!loaded || !!busy || exporting || syncing}
           >
             <Download size={16} /> ส่งออกวิดีโอ
           </button>
@@ -804,6 +887,14 @@ export default function App() {
                   สร้างท่อนร้อง <Plus size={14} />
                 </button>
               </div>
+              {project.lyrics.length > 0 && (
+                <button
+                  className="primary sync-cta"
+                  onClick={() => setTab("analysis")}
+                >
+                  <AudioLines size={15} /> ตรวจคำที่ร้องให้ตรงเนื้อเพลง
+                </button>
+              )}
               <div className="section-heading">
                 <h3>
                   ท่อนร้อง{" "}
@@ -859,7 +950,9 @@ export default function App() {
                         )}
                         <p>{s.text}</p>
                         <small>
-                          {timecode(s.start)} — {timecode(s.end)}
+                          {s.source === "estimated"
+                            ? "ยังไม่ได้เทียบคำร้อง · เวลาคร่าว ๆ"
+                            : `${timecode(s.start)} — ${timecode(s.end)}`}
                         </small>
                       </div>
                       <span
@@ -869,7 +962,9 @@ export default function App() {
                             ? "เวลาประมาณ"
                             : s.source === "imported"
                               ? "เวลาจากไฟล์"
-                              : "ปรับด้วยตนเอง"
+                              : s.source === "recognized"
+                                ? "เวลาจากคำที่ถอดเสียง"
+                                : "ปรับด้วยตนเอง"
                         }
                       />
                     </button>
@@ -880,6 +975,27 @@ export default function App() {
           ) : null}
           {tab === "analysis" && (
             <div className="analysis-content">
+              <SyncPanel
+                project={project}
+                audioData={audioData}
+                onChange={commit}
+                onSelect={(s) => {
+                  setSelected(s.id);
+                  seek(
+                    s.alignment?.words.find((w) => w.start !== null)?.start ??
+                      s.start,
+                  );
+                }}
+                onBusy={(value) => {
+                  setSyncing(value);
+                  if (value) {
+                    audio.current?.pause();
+                    setTap(false);
+                  }
+                }}
+                onError={fail}
+                onNotice={setNotice}
+              />
               <p className="muted">
                 ตรวจโครงสร้างเนื้อเพลงและช่วงเวลาในเครื่อง
                 ไม่ส่งเสียงไปยังบริการภายนอก
@@ -902,35 +1018,39 @@ export default function App() {
                   <span>เวลาที่ยังประมาณ</span>
                 </div>
               </div>
-              <h3>เสนอเวลาจากสัญญาณเสียง</h3>
-              <p className="muted">
-                ใช้พลังงานเสียงหาแนวช่วงที่มีเสียง แล้วแบ่งตามจำนวนคำ
-                เป็นเพียงจุดเริ่มต้น ดนตรีอาจถูกนับเป็นเสียงร้อง
-                ยังไม่มีโมเดลแยกเสียงร้องหรือ Forced Alignment
-              </p>
-              <button
-                className="secondary full"
-                disabled={!audioData || !project.lyrics.length}
-                onClick={() => {
-                  try {
-                    commit((p) => ({
-                      ...p,
-                      lyrics: suggestTiming(
-                        p.lyrics,
-                        audioData!.energy,
-                        p.duration,
-                      ),
-                    }));
-                    setNotice(
-                      "สร้างเวลาประมาณแล้ว กรุณาฟังและจับเวลา IN / OUT ทุกท่อน",
-                    );
-                  } catch (e) {
-                    fail(e);
-                  }
-                }}
-              >
-                <AudioLines size={16} /> วิเคราะห์เสียงและเสนอเวลา
-              </button>
+              <details className="rough-timing">
+                <summary>
+                  เครื่องมือเดิม: แบ่งเวลาคร่าว ๆ (ไม่เทียบคำร้อง)
+                </summary>
+                <p className="muted">
+                  ใช้พลังงานเสียงหาแนวช่วงที่มีเสียง แล้วแบ่งตามจำนวนคำ
+                  เป็นเพียงจุดเริ่มต้น ดนตรีอาจถูกนับเป็นเสียงร้อง
+                  ยังไม่มีโมเดลแยกเสียงร้องหรือ Forced Alignment
+                </p>
+                <button
+                  className="secondary full"
+                  disabled={!audioData || !project.lyrics.length}
+                  onClick={() => {
+                    try {
+                      commit((p) => ({
+                        ...p,
+                        lyrics: suggestTiming(
+                          p.lyrics,
+                          audioData!.energy,
+                          p.duration,
+                        ).map(clearMatch),
+                      }));
+                      setNotice(
+                        "สร้างเวลาประมาณแล้ว กรุณาฟังและจับเวลา IN / OUT ทุกท่อน",
+                      );
+                    } catch (e) {
+                      fail(e);
+                    }
+                  }}
+                >
+                  <AudioLines size={16} /> วิเคราะห์เสียงและเสนอเวลา
+                </button>
+              </details>
               <h3>โครงสร้างและท่อนซ้ำ</h3>
               <div className="info-box">
                 {analysis.sections.length
@@ -1073,6 +1193,11 @@ export default function App() {
           <div className="preview-toolbar">
             <span>
               <i className="live-dot" /> LIVE PREVIEW
+              {active?.source === "estimated" && (
+                <small className="preview-alignment">
+                  ยังไม่ได้เทียบกับเสียงร้อง
+                </small>
+              )}
             </span>
             <div>
               <select
@@ -1253,8 +1378,64 @@ export default function App() {
                   ? "◌ เวลาประมาณ · ต้องตรวจฟัง"
                   : current.source === "imported"
                     ? "↗ เวลาอ้างอิงจากไฟล์เนื้อเพลง"
-                    : "✓ เวลาที่ปรับด้วยตนเอง"}
+                    : current.source === "recognized"
+                      ? "♫ เวลาจากการเทียบคำร้อง"
+                      : "✓ เวลาที่ปรับด้วยตนเอง"}
               </div>
+              {current.alignment ? (
+                <>
+                  <WordTimingEditor
+                    key={current.id}
+                    segment={current}
+                    onChange={(alignment) =>
+                      editSegment(current.id, { alignment })
+                    }
+                    onStamp={() => audio.current?.currentTime ?? 0}
+                    onListen={(start, end) => {
+                      seek(Math.max(0, start - 0.2));
+                      auditionEnd.current = Math.min(
+                        project.duration,
+                        end + 0.2,
+                      );
+                      if (audio.current?.paused) void playPause();
+                    }}
+                  />
+                  <button
+                    className="primary full apply-line"
+                    disabled={!lineCanApply(current.alignment)}
+                    onClick={() => {
+                      try {
+                        editSegment(current.id, applyAlignment(current));
+                        setNotice(
+                          "ใช้เวลาคำกับท่อนนี้แล้ว ภาพตัวอย่างจะแสดงคำตามเวลา",
+                        );
+                      } catch (e) {
+                        fail(e);
+                      }
+                    }}
+                  >
+                    ใช้เวลารายคำกับท่อนนี้
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="secondary full"
+                  onClick={() =>
+                    editSegment(current.id, {
+                      alignment: {
+                        model: "กำหนดเอง",
+                        language: "thai",
+                        status: "proposed",
+                        words: splitWords(current.text).map((w) =>
+                          manualWord(w.text, w.from, w.to),
+                        ),
+                      },
+                    })
+                  }
+                >
+                  จับเวลารายคำด้วยตนเอง
+                </button>
+              )}
               <button
                 className="danger text-button"
                 onClick={() => {
@@ -1327,9 +1508,7 @@ export default function App() {
                 commit((p) => ({
                   ...p,
                   lyrics: p.lyrics.map((x) => ({
-                    ...x,
-                    start: x.start + offset,
-                    end: x.end + offset,
+                    ...shiftSegment(x, offset),
                     source: "manual",
                   })),
                 }));
@@ -1415,7 +1594,7 @@ export default function App() {
                 {project.lyrics.map((s, i) => (
                   <div
                     key={s.id}
-                    className={`clip ${s.id === selected ? "selected" : ""}`}
+                    className={`clip ${s.source} ${s.id === selected ? "selected" : ""}`}
                     style={{
                       left: `${(s.start / (project.duration || 120)) * 100}%`,
                       width: `${Math.max(0.1, ((s.end - s.start) / (project.duration || 120)) * 100)}%`,
@@ -1428,6 +1607,19 @@ export default function App() {
                       onPointerDown={(e) => dragClip(e, s, "start")}
                     />
                     <span className="clip-text">{s.text}</span>
+                    {s.alignment?.status === "applied" &&
+                      s.alignment.words.map((word, index) =>
+                        word.start !== null && word.end !== null ? (
+                          <span
+                            key={index}
+                            className="word-tick"
+                            style={{
+                              left: `${((word.start - s.start) / (s.end - s.start)) * 100}%`,
+                              width: `${((word.end - word.start) / (s.end - s.start)) * 100}%`,
+                            }}
+                          />
+                        ) : null,
+                      )}
                     <span
                       className="handle right"
                       onPointerDown={(e) => dragClip(e, s, "end")}
@@ -1453,7 +1645,7 @@ export default function App() {
             ms
           </span>
           <span>
-            BK STUDIO <b>1.0</b>
+            BK STUDIO <b>1.1</b>
           </span>
         </footer>
       </section>
@@ -1497,15 +1689,16 @@ export default function App() {
               </li>
             </ol>
             <p className="note">
-              การเสนอเวลาใช้พลังงานเสียง ไม่ใช่ AI แยกเสียงร้องหรือ Forced
-              Alignment จึงต้องตรวจฟัง ไม่มีการรับประกันตรง 100%
+              แท็บวิเคราะห์มี Whisper ถอดเสียงในเครื่องพร้อมเวลา
+              แล้วเทียบตัวอักษรกับเนื้อเพลง
+              กดท่อนที่ต้องตรวจเพื่อฟังและแก้เวลารายคำ กดใช้เวลาหลังตรวจแล้ว
+              ระบบนี้ยังไม่ใช่ Forced Alignment และไม่รับประกันตรง 100%
               บันทึกอัตโนมัติด้วย IndexedDB เฉพาะเบราว์เซอร์นี้ JSON ไม่รวมเพลง
               ต้องแนบเพลงอีกครั้งเมื่อย้ายเครื่อง
             </p>
             <p className="note">
-              รุ่นนี้ยังไม่มีถอดเสียงอัตโนมัติ แปลภาษา ไฮไลต์รายคำ MP4 4K
-              เอฟเฟกต์ 3D หรือหลายแทร็ก แนะนำ Chrome / Edge บนคอมพิวเตอร์
-              เก็บแท็บไว้ด้านหน้าขณะส่งออก
+              รุ่นนี้ยังไม่มีแปลภาษา MP4 4K เอฟเฟกต์ 3D หรือหลายแทร็ก แนะนำ
+              Chrome / Edge บนคอมพิวเตอร์ เก็บแท็บไว้ด้านหน้าขณะส่งออก
             </p>
             <button className="primary full" onClick={() => setHelp(false)}>
               เริ่มสร้างสรรค์

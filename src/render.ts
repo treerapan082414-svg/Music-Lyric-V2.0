@@ -48,27 +48,54 @@ export function renderFrame(
   if (active) {
     const fontSize = (s.fontSize * h) / 720;
     ctx.font = `700 ${fontSize}px sans-serif`;
-    const lines: string[] = [];
+    const lines: { text: string; from: number }[] = [];
+    let offset = 0;
     for (const raw of active.text.split("\n")) {
       let line = "";
+      let from = offset;
       for (const part of new Intl.Segmenter("th", {
         granularity: "grapheme",
       }).segment(raw)) {
         if (ctx.measureText(line + part.segment).width > w * 0.84 && line) {
-          lines.push(line);
+          lines.push({ text: line, from });
+          from = offset + part.index;
           line = "";
         }
         line += part.segment;
       }
-      lines.push(line);
+      lines.push({ text: line, from });
+      offset += raw.length + 1;
     }
     const y = (h * s.position) / 100 - (lines.length - 1) * fontSize * 0.72;
     ctx.shadowColor = "#00000090";
     ctx.shadowBlur = 12;
     ctx.fillStyle = s.color;
-    lines.forEach((line, i) =>
-      ctx.fillText(line, w / 2, y + i * fontSize * 1.45),
-    );
+    lines.forEach((line, i) => {
+      const baseline = y + i * fontSize * 1.45;
+      ctx.fillStyle = s.color;
+      ctx.textAlign = "center";
+      ctx.fillText(line.text, w / 2, baseline);
+      if (active.alignment?.status === "applied")
+        for (const word of active.alignment.words) {
+          if (word.start === null || word.end === null || time < word.start)
+            continue;
+          const from = Math.max(word.from, line.from);
+          const to = Math.min(word.to, line.from + line.text.length);
+          if (to <= from) continue;
+          const left = w / 2 - ctx.measureText(line.text).width / 2;
+          const prefix = line.text.slice(0, from - line.from);
+          ctx.textAlign = "left";
+          ctx.fillStyle = s.accent;
+          ctx.globalAlpha = time < word.end ? 1 : 0.55;
+          ctx.fillText(
+            active.text.slice(from, to),
+            left + ctx.measureText(prefix).width,
+            baseline,
+          );
+          ctx.globalAlpha = 1;
+        }
+    });
+    ctx.textAlign = "center";
     ctx.shadowBlur = 0;
     ctx.fillStyle = s.accent;
     ctx.fillRect(

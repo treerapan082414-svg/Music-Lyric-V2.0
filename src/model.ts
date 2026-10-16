@@ -1,9 +1,11 @@
+import { lineCanApply, type LineAlignment, type Transcript } from "./alignment";
 export type Segment = {
   id: string;
   text: string;
   start: number;
   end: number;
-  source: "estimated" | "imported" | "manual";
+  source: "estimated" | "imported" | "manual" | "recognized";
+  alignment?: LineAlignment;
   section?: string;
   translation?: string;
 };
@@ -24,6 +26,8 @@ export type Project = {
   style: Style;
   audioName: string;
   duration: number;
+  audioFingerprint?: string;
+  transcript?: Transcript;
 };
 export const defaultStyle: Style = {
   color: "#ffffff",
@@ -198,7 +202,7 @@ export function validateProject(raw: unknown): Project {
       !Number.isFinite(x.end) ||
       x.start < 0 ||
       x.end <= x.start ||
-      !["estimated", "manual", "imported"].includes(x.source)
+      !["estimated", "manual", "imported", "recognized"].includes(x.source)
     )
       throw new Error("ข้อมูลเนื้อเพลงหรือเวลาไม่ถูกต้อง");
   if (
@@ -215,6 +219,69 @@ export function validateProject(raw: unknown): Project {
     p.style.position > 85
   )
     throw new Error("รูปแบบโปรเจกต์ไม่ถูกต้อง");
+  for (const x of p.lyrics) {
+    const a = x.alignment;
+    if (!a) continue;
+    if (
+      !["proposed", "applied"].includes(a.status) ||
+      typeof a.model !== "string" ||
+      typeof a.language !== "string" ||
+      !Array.isArray(a.words) ||
+      a.words.length > 10000
+    )
+      throw new Error("ข้อมูลการเทียบคำไม่ถูกต้อง");
+    for (const w of a.words)
+      if (
+        typeof w.text !== "string" ||
+        typeof w.heard !== "string" ||
+        !Number.isInteger(w.from) ||
+        !Number.isInteger(w.to) ||
+        w.from < 0 ||
+        w.to <= w.from ||
+        x.text.slice(w.from, w.to) !== w.text ||
+        !["exact", "close", "missing", "manual"].includes(w.match) ||
+        !Number.isFinite(w.similarity) ||
+        w.similarity < 0 ||
+        w.similarity > 1 ||
+        typeof w.shared !== "boolean" ||
+        ![w.start, w.end].every(
+          (t) =>
+            t === null ||
+            (typeof t === "number" &&
+              Number.isFinite(t) &&
+              t >= 0 &&
+              t <= p.duration + 0.1),
+        )
+      )
+        throw new Error("ข้อมูลเวลารายคำไม่ถูกต้อง");
+    if (
+      a.status === "applied" &&
+      (!lineCanApply(a) ||
+        a.words[0].start! < x.start - 0.025 ||
+        a.words[a.words.length - 1].end! > x.end + 0.025)
+    )
+      throw new Error("เวลารายคำไม่สัมพันธ์กับเวลาท่อน");
+  }
+  if (p.transcript) {
+    const t = p.transcript;
+    if (
+      typeof t.model !== "string" ||
+      typeof t.language !== "string" ||
+      typeof t.text !== "string" ||
+      !Array.isArray(t.words) ||
+      t.words.length > 30000 ||
+      t.words.some(
+        (w) =>
+          typeof w.text !== "string" ||
+          !Number.isFinite(w.start) ||
+          !Number.isFinite(w.end) ||
+          w.start < 0 ||
+          w.end <= w.start ||
+          w.end > p.duration + 0.1,
+      )
+    )
+      throw new Error("ข้อมูลถอดเสียงไม่ถูกต้อง");
+  }
   return { ...p, lyrics: p.lyrics.map((x) => ({ ...x, id: uid() })) };
 }
 export function exportLrc(lyrics: Segment[]) {

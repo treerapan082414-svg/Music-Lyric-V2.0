@@ -35,7 +35,7 @@ test("upload, timeline, editing, save/reload, and two real audiovisual exports",
   page.on("pageerror", (e) => errors.push(e.message));
   await page.setViewportSize({ width: 1440, height: 1000 });
   await page.goto("/");
-  await expect(page.getByText("กำลังเปิดสตูดิโอ…")).toHaveCount(0);
+  await expect(page.locator('.studio[data-ready="true"]')).toBeVisible();
   for (const ext of ["mp3", "wav"]) {
     await page
       .locator("input[type=file]")
@@ -62,6 +62,7 @@ test("upload, timeline, editing, save/reload, and two real audiovisual exports",
   await expect(page.locator(".clip")).toHaveCount(2);
   await page.getByRole("button", { name: "วิเคราะห์", exact: true }).click();
   await expect(page.locator(".stat-grid b").first()).toHaveText("2");
+  await page.locator(".rough-timing summary").click();
   await page.getByRole("button", { name: "วิเคราะห์เสียงและเสนอเวลา" }).click();
   await expect(page.getByRole("status")).toContainText("เวลาประมาณ");
   await page.getByRole("button", { name: "เนื้อเพลง", exact: true }).click();
@@ -171,7 +172,7 @@ test("upload, timeline, editing, save/reload, and two real audiovisual exports",
 });
 test("LRC import and unsupported encoder error are real", async ({ page }) => {
   await page.goto("/");
-  await expect(page.getByText("กำลังเปิดสตูดิโอ…")).toHaveCount(0);
+  await expect(page.locator('.studio[data-ready="true"]')).toBeVisible();
   await page
     .locator("input[type=file]")
     .nth(0)
@@ -203,7 +204,7 @@ test("manual IN/OUT, tap timing, JSON roundtrip and cancel export", async ({
   page,
 }) => {
   await page.goto("/");
-  await expect(page.getByText("กำลังเปิดสตูดิโอ…")).toHaveCount(0);
+  await expect(page.locator('.studio[data-ready="true"]')).toBeVisible();
   await page
     .locator("input[type=file]")
     .nth(0)

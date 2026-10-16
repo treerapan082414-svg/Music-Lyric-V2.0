@@ -32,3 +32,24 @@ export async function decodeAudio(file: Blob): Promise<AudioData> {
     await context.close();
   }
 }
+export async function resampleForAsr(
+  buffer: AudioBuffer,
+  from: number,
+  to: number,
+): Promise<Float32Array> {
+  if (
+    !Number.isFinite(from) ||
+    !Number.isFinite(to) ||
+    from < 0 ||
+    to > buffer.duration + 0.01 ||
+    to - from < 0.1
+  )
+    throw new Error("ช่วงเวลาวิเคราะห์ไม่ถูกต้อง");
+  const ctx = new OfflineAudioContext(1, Math.ceil((to - from) * 16000), 16000);
+  const source = ctx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(ctx.destination);
+  source.start(0, from, to - from);
+  const rendered = await ctx.startRendering();
+  return rendered.getChannelData(0).slice();
+}
